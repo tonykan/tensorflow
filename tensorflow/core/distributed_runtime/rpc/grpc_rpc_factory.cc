@@ -187,8 +187,8 @@ void GrpcRPCFactory::CreateCall(const Tensor& request_t, const bool try_rpc,
 
 void GrpcRPCFactory::StartCall(const Tensor& address_t, const Tensor& method_t,
                                GrpcCall* call) {
-  auto address = address_t.flat<string>();
-  auto method = method_t.flat<string>();
+  auto address = address_t.flat<tstring>();
+  auto method = method_t.flat<tstring>();
   // Stubs are maintained by the GrpcRPCFactory class and will be
   // deleted when the class is destroyed.
   ::grpc::GenericStub* singleton_stub = nullptr;
@@ -210,7 +210,7 @@ void GrpcRPCFactory::StartCall(const Tensor& address_t, const Tensor& method_t,
       get_stub(index), &completion_queue_, *get_method_ptr(index),
       call->request(), call->response(),
       /*done=*/[call](const Status& s) { call->Done(s); }, call->call_opts(),
-      nullptr /*threadpool*/, fail_fast_, timeout_in_ms_);
+      nullptr /*threadpool*/, fail_fast_, timeout_in_ms_, 0 /* max_retries */);
 }
 
 }  // namespace tensorflow

@@ -68,9 +68,11 @@ class XRTCompileOp : public OpKernel {
 
 Status CompilationCacheKey(const xrt::XLAComputation& computation,
                            string* key) {
-  string serialized;
-  TF_RET_CHECK(SerializeToStringDeterministic(computation, &serialized));
-  uint64 fingerprint = Fingerprint64(serialized);
+  const size_t size = computation.ByteSizeLong();
+  auto serialized = absl::make_unique<char[]>(size);
+  TF_RET_CHECK(
+      SerializeToBufferDeterministic(computation, serialized.get(), size));
+  uint64 fingerprint = Fingerprint64(absl::string_view(serialized.get(), size));
   *key = absl::StrCat(fingerprint);
   return Status::OK();
 }
@@ -149,7 +151,7 @@ void XRTCompileOp::Compute(OpKernelContext* ctx) {
   xrt::XLAComputation computation_proto;
   OP_REQUIRES(
       ctx,
-      computation_proto.ParseFromString(computation_input.scalar<string>()()),
+      computation_proto.ParseFromString(computation_input.scalar<tstring>()()),
       errors::InvalidArgument(
           "Unable to parse computation input to XLAComputation"));
 
@@ -189,7 +191,7 @@ void XRTCompileOp::Compute(OpKernelContext* ctx) {
                                              .ComputeProgramShape()
                                              .ToProto();
   Tensor program_shape_output(DT_STRING, TensorShape({1}));
-  program_shape_output.vec<string>()(0) = program_shape.SerializeAsString();
+  program_shape_output.vec<tstring>()(0) = program_shape.SerializeAsString();
   ctx->set_output(1, program_shape_output);
 }
 
@@ -215,11 +217,6 @@ XRTReleaseCompilationRefOp::~XRTReleaseCompilationRefOp() = default;
 void XRTReleaseCompilationRefOp::Compute(OpKernelContext* ctx) {
   VLOG(1) << "XRTReleaseCompilationRefOp::Compute";
 
-  const Tensor& key_tensor = ctx->input(0);
-  OP_REQUIRES(ctx, TensorShapeUtils::IsScalar(key_tensor.shape()),
-              errors::Internal("computation key should be a string scalar"));
-  int64 uid = key_tensor.scalar<int64>()();
-
   ResourceMgr* rm;
   OP_REQUIRES_OK(ctx, XRTGenericDeviceAccessor::GetResourceManager(ctx, &rm));
 
@@ -230,9 +227,13 @@ void XRTReleaseCompilationRefOp::Compute(OpKernelContext* ctx) {
                           kXRTCompilationCacheResourceName, &cache));
   core::ScopedUnref cache_unref(cache);
 
-  OP_REQUIRES_OK(ctx, cache->Release(uid));
-
-  VLOG(2) << "Released computation handle " << uid;
+  const Tensor& keys_tensor = ctx->input(0);
+  auto flat_keys = keys_tensor.flat<int64>();
+  for (int64 i = 0; i < flat_keys.size(); ++i) {
+    int64 key = flat_keys(i);
+    OP_REQUIRES_OK(ctx, cache->Release(key));
+    VLOG(2) << "Released computation handle " << key;
+  }
 }
 
 }  // namespace

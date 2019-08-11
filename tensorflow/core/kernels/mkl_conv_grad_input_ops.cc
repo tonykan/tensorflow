@@ -295,11 +295,12 @@ class MklConvBwdInputPrimitiveFactory : public MklPrimitiveFactory<T> {
   }
 };
 
-template <typename Device, class T>
-class MklConvCustomBackpropInputOp : public MklConvBackpropCommonOp<Device, T> {
+template <typename Device, class T, bool is_depthwise, bool eager_mode>
+class MklConvCustomBackpropInputOp
+    : public MklConvBackpropCommonOp<Device, T, is_depthwise> {
  public:
   explicit MklConvCustomBackpropInputOp(OpKernelConstruction* context)
-      : MklConvBackpropCommonOp<Device, T>(context) {}
+      : MklConvBackpropCommonOp<Device, T, is_depthwise>(context) {}
 
   ~MklConvCustomBackpropInputOp() {}
 
@@ -318,9 +319,9 @@ class MklConvCustomBackpropInputOp : public MklConvBackpropCommonOp<Device, T> {
       const Tensor& diff_dst_tensor = MklGetInput(context, kOutbpropIdx);
 
       MklDnnShape src_mkl_shape, filter_mkl_shape, diff_dst_mkl_shape;
-      GetMklShape(context, kInputIdx, &src_mkl_shape);
-      GetMklShape(context, kFilterIdx, &filter_mkl_shape);
-      GetMklShape(context, kOutbpropIdx, &diff_dst_mkl_shape);
+      GetMklShape(context, kInputIdx, &src_mkl_shape, eager_mode);
+      GetMklShape(context, kFilterIdx, &filter_mkl_shape, eager_mode);
+      GetMklShape(context, kOutbpropIdx, &diff_dst_mkl_shape, eager_mode);
       // Allow operator-specific sanity checking of shapes.
       ValidateMklShapes(src_mkl_shape, filter_mkl_shape, diff_dst_mkl_shape);
 
@@ -331,7 +332,8 @@ class MklConvCustomBackpropInputOp : public MklConvBackpropCommonOp<Device, T> {
       // allow this class to handle this case.
       TensorShape src_tf_shape = MakeInputTfShape(context, src_tensor);
       TensorShape filter_tf_shape = MakeFilterTfShape(context, filter_tensor);
-      TensorShape diff_dst_tf_shape = GetTfShape(context, kOutbpropIdx);
+      TensorShape diff_dst_tf_shape =
+          GetTfShape(context, kOutbpropIdx, eager_mode);
 
       // Corner cases: output with 0 elements and 0 batch size.
       Tensor* diff_src_tensor = nullptr;
@@ -344,13 +346,14 @@ class MklConvCustomBackpropInputOp : public MklConvBackpropCommonOp<Device, T> {
             GetOutputTfShape(src_tf_shape, filter_tf_shape, diff_dst_tf_shape);
         const int kOutputIdx = 0;
         AllocateOutputSetMklShape(context, kOutputIdx, &diff_src_tensor,
-                                  diff_src_tf_shape, diff_src_mkl_shape);
+                                  diff_src_tf_shape, diff_src_mkl_shape,
+                                  eager_mode);
         CHECK_NOTNULL(diff_src_tensor);
 
         // if output tensor has more than 0 elements, we need to 0 them out.
         auto diff_src_data = diff_src_tensor->flat<T>().data();
         for (size_t i = 0; i < diff_src_tf_shape.num_elements(); ++i) {
-          diff_src_data[i] = 0;
+          diff_src_data[i] = static_cast<T>(0);
         }
         return;
       }
@@ -367,7 +370,7 @@ class MklConvCustomBackpropInputOp : public MklConvBackpropCommonOp<Device, T> {
       conv_utl.GetConvFwdSizesInMklOrder(
           src_tf_shape, filter_tf_shape, &fwd_src_dims, &fwd_filter_dims,
           &strides, &dilations, &fwd_output_dims_tf_order, &fwd_output_dims,
-          &padding_left, &padding_right, false);
+          &padding_left, &padding_right, false, is_depthwise);
       if (!context->status().ok()) return;
 
       // Create Convolution forward descriptor since Convolution backward
@@ -383,9 +386,11 @@ class MklConvCustomBackpropInputOp : public MklConvBackpropCommonOp<Device, T> {
       auto fwd_filter_md =
           filter_mkl_shape.IsMklTensor()
               ? filter_mkl_shape.GetMklLayout()
-              : memory::desc(
-                    fwd_filter_dims, MklDnnType<T>(),
-                    is_conv2d ? memory::format::hwio : memory::format::dhwio);
+              : memory::desc(fwd_filter_dims, MklDnnType<T>(),
+                             is_depthwise
+                                 ? memory::hwigo
+                                 : (is_conv2d ? memory::format::hwio
+                                              : memory::format::dhwio));
 
       conv_utl.GetInputSizeInMklOrder(diff_dst_tf_shape, &diff_dst_dims);
       if (!context->status().ok()) return;
@@ -426,9 +431,13 @@ class MklConvCustomBackpropInputOp : public MklConvBackpropCommonOp<Device, T> {
                                      bwd_diff_src_dims, bwd_diff_src_format);
       TensorShape diff_src_tf_shape;
       diff_src_tf_shape.AddDim(diff_src_pd.get_size() / sizeof(T));
+      Tensor tmp_tensor;
+      if (eager_mode) {
+        AllocTmpBuffer<T>(context, &tmp_tensor, diff_src_tf_shape);
+        diff_src_tf_shape = diff_src_mkl_shape.GetTfShape();
+      }
       AllocateOutputSetMklShape(context, 0, &diff_src_tensor, diff_src_tf_shape,
-                                diff_src_mkl_shape);
-
+                                diff_src_mkl_shape, eager_mode);
       T* diff_src_data =
           static_cast<T*>(const_cast<T*>(diff_src_tensor->flat<T>().data()));
 
@@ -455,7 +464,25 @@ class MklConvCustomBackpropInputOp : public MklConvBackpropCommonOp<Device, T> {
       }
 
       // execute convolution input bwd
-      conv_bwd_input->Execute(diff_src_data, filter_data, diff_dst_data);
+      if (!eager_mode) {
+        conv_bwd_input->Execute(diff_src_data, filter_data, diff_dst_data);
+      } else {
+        // In eager mode we first write the output to temporary
+        // buffer in MKL format. Then we convert the data to TF format.
+        T* tmp_data =
+            static_cast<T*>(const_cast<T*>(tmp_tensor.flat<T>().data()));
+        conv_bwd_input->Execute(tmp_data, filter_data, diff_dst_data);
+        auto output_tf_md = diff_src_mkl_shape.GetTfLayout();
+        auto output_tf_pd = memory::primitive_desc(output_tf_md, cpu_engine);
+        mkldnn::reorder::primitive_desc reorder_pd =
+            mkldnn::reorder::primitive_desc(diff_src_pd, output_tf_pd);
+        std::vector<mkldnn::primitive> net;
+        memory* tmp_data_mem = new memory(diff_src_pd, tmp_data);
+        memory* dst_data_mem = new memory(output_tf_pd, diff_src_data);
+        net.push_back(
+            mkldnn::reorder(reorder_pd, *tmp_data_mem, *dst_data_mem));
+        stream(stream::kind::eager).submit(net).wait();
+      }
 
       // delete primitive since it is not cached.
       if (do_not_cache) {
@@ -503,7 +530,7 @@ class MklConvCustomBackpropInputOp : public MklConvBackpropCommonOp<Device, T> {
   // Get TensorFlow shape of filter tensor.
   TensorShape MakeFilterTfShape(OpKernelContext* context,
                                 const Tensor& filter_tensor) {
-    return GetTfShape(context, kInputIndex_Filter);
+    return GetTfShape(context, kInputIndex_Filter, eager_mode);
   }
 
   // Get the Tensorflow shape of Output (diff_src),
@@ -554,19 +581,33 @@ class MklConvCustomBackpropInputOp : public MklConvBackpropCommonOp<Device, T> {
   }
 };
 
-#define REGISTER_MKL_CPU_KERNELS(T)                                    \
-  REGISTER_KERNEL_BUILDER(Name("_MklConv2DBackpropInput")              \
-                              .Device(DEVICE_CPU)                      \
-                              .TypeConstraint<T>("T")                  \
-                              .Label(mkl_op_registry::kMklOpLabel),    \
-                          MklConvCustomBackpropInputOp<CPUDevice, T>); \
-  REGISTER_KERNEL_BUILDER(Name("_MklConv3DBackpropInputV2")            \
-                              .Device(DEVICE_CPU)                      \
-                              .TypeConstraint<T>("T")                  \
-                              .Label(mkl_op_registry::kMklOpLabel),    \
-                          MklConvCustomBackpropInputOp<CPUDevice, T>);
-
+#define REGISTER_MKL_CPU_KERNELS(T)                              \
+  REGISTER_KERNEL_BUILDER(                                       \
+      Name("_MklConv2DBackpropInput")                            \
+          .Device(DEVICE_CPU)                                    \
+          .TypeConstraint<T>("T")                                \
+          .Label(mkl_op_registry::kMklLayoutDependentOpLabel),   \
+      MklConvCustomBackpropInputOp<CPUDevice, T, false, false>); \
+  REGISTER_KERNEL_BUILDER(                                       \
+      Name("_MklEagerConv2DBackpropInput")                       \
+          .Device(DEVICE_CPU)                                    \
+          .TypeConstraint<T>("T")                                \
+          .Label(mkl_op_registry::kMklNameChangeOpLabel),        \
+      MklConvCustomBackpropInputOp<CPUDevice, T, false, true>);  \
+  REGISTER_KERNEL_BUILDER(                                       \
+      Name("_MklConv3DBackpropInputV2")                          \
+          .Device(DEVICE_CPU)                                    \
+          .TypeConstraint<T>("T")                                \
+          .Label(mkl_op_registry::kMklLayoutDependentOpLabel),   \
+      MklConvCustomBackpropInputOp<CPUDevice, T, false, false>); \
+  REGISTER_KERNEL_BUILDER(                                       \
+      Name("_MklDepthwiseConv2dNativeBackpropInput")             \
+          .Device(DEVICE_CPU)                                    \
+          .TypeConstraint<T>("T")                                \
+          .Label(mkl_op_registry::kMklLayoutDependentOpLabel),   \
+      MklConvCustomBackpropInputOp<CPUDevice, T, true, false>);
 TF_CALL_float(REGISTER_MKL_CPU_KERNELS);
+TF_CALL_bfloat16(REGISTER_MKL_CPU_KERNELS);
 #undef REGISTER_MKL_CPU_KERNELS
 
 }  // namespace tensorflow

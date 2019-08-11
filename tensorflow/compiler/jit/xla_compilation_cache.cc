@@ -18,7 +18,9 @@ limitations under the License.
 #include <numeric>
 
 #include "absl/strings/str_cat.h"
-#include "tensorflow/compiler/tf2xla/dump_graph.h"
+#include "absl/strings/str_join.h"
+#include "tensorflow/compiler/jit/xla_activity.pb.h"
+#include "tensorflow/compiler/jit/xla_activity_listener.h"
 #include "tensorflow/compiler/tf2xla/shape_util.h"
 #include "tensorflow/compiler/tf2xla/type_util.h"
 #include "tensorflow/compiler/tf2xla/xla_context.h"
@@ -26,17 +28,20 @@ limitations under the License.
 #include "tensorflow/core/common_runtime/device.h"
 #include "tensorflow/core/common_runtime/function.h"
 #include "tensorflow/core/common_runtime/graph_optimizer.h"
+#include "tensorflow/core/common_runtime/metrics.h"
 #include "tensorflow/core/framework/attr_value_util.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/graph/graph_constructor.h"
 #include "tensorflow/core/graph/node_builder.h"
-#include "tensorflow/core/kernels/variable_ops.h"
 #include "tensorflow/core/lib/hash/hash.h"
 #include "tensorflow/core/platform/env.h"
 #include "tensorflow/core/platform/logging.h"
 #include "tensorflow/core/public/version.h"
+#include "tensorflow/core/util/dump_graph.h"
 
 namespace tensorflow {
+
+constexpr int64 XlaCompilationCache::kDefaultCompilationThreshold;
 
 XlaCompilationCache::XlaCompilationCache(xla::LocalClient* client,
                                          DeviceType device_type)
@@ -60,7 +65,7 @@ XlaCompilationCache::~XlaCompilationCache() {
   // about?
 }
 
-string XlaCompilationCache::DebugString() {
+string XlaCompilationCache::DebugString() const {
   return "XLA JIT compilation cache";
 }
 
@@ -68,9 +73,9 @@ string XlaCompilationCache::DebugString() {
 // arguments in the supplied list.
 string XlaCompilationCache::Signature::HumanString() const {
   string result = name;
-  for (const auto& a : arg_types) {
-    absl::StrAppend(&result, ",", DataTypeString(a.first),
-                    a.second.DebugString());
+  for (const auto& a : arg_shapes) {
+    absl::StrAppend(&result, ",", DataTypeString(a.first));
+    absl::StrAppend(&result, " [", absl::StrJoin(a.second, ","), "]");
   }
 
   for (const auto& v : arg_values) {
@@ -81,7 +86,7 @@ string XlaCompilationCache::Signature::HumanString() const {
 
 bool XlaCompilationCache::Signature::operator==(const Signature& other) const {
   if (name != other.name) return false;
-  if (arg_types != other.arg_types) return false;
+  if (arg_shapes != other.arg_shapes) return false;
 
   if (arg_values.size() != other.arg_values.size()) return false;
   for (int i = 0; i < arg_values.size(); ++i) {
@@ -97,10 +102,10 @@ bool XlaCompilationCache::Signature::operator==(const Signature& other) const {
 uint64 XlaCompilationCache::Signature::Hash::operator()(
     const XlaCompilationCache::Signature& signature) const {
   uint64 h = std::hash<string>()(signature.name);
-  for (const auto& arg : signature.arg_types) {
+  for (const auto& arg : signature.arg_shapes) {
     h = Hash64Combine(h, std::hash<int>()(static_cast<int>(arg.first)));
-    h = Hash64Combine(h, std::hash<int>()(arg.second.dims()));
-    for (int dim : arg.second.dim_sizes()) {
+    h = Hash64Combine(h, std::hash<int>()(arg.second.size()));
+    for (int dim : arg.second) {
       h = Hash64Combine(h, std::hash<int>()(dim));
     }
   }
@@ -124,7 +129,7 @@ XlaCompilationCache::BuildSignature(
         break;
       case XlaCompiler::Argument::kParameter:
       case XlaCompiler::Argument::kResource:
-        signature.arg_types.emplace_back(arg.type, arg.shape);
+        signature.arg_shapes.emplace_back(arg.type, arg.DimensionSizes());
         break;
       default:
         return errors::InvalidArgument(
@@ -203,6 +208,10 @@ Status XlaCompilationCache::CompileSingleOp(
   NameAttrList name;
   name.set_name(def.op());
   *name.mutable_attr() = def.attr();
+  // Remove the "_class" attribute from the attribute set used to create the
+  // compilation cache key. This attribute is information for the colocator
+  // and causes false uniqueness between nodes.
+  name.mutable_attr()->erase("_class");
   auto compile_op = [&](XlaCompiler* compiler,
                         XlaCompiler::CompilationResult* result) {
     std::vector<DataType> result_dtypes(ctx->num_outputs());
@@ -294,6 +303,9 @@ Status XlaCompilationCache::CompileImpl(
       }
 
       if (is_megamorphic) {
+        BroadcastOptimizationRemark(XlaOptimizationRemark::MEGAMORPHIC_FUNCTION,
+                                    function.name())
+            .IgnoreError();
         VLOG(3) << "Not compiling cluster " << function.name()
                 << " because it is megamorphic.";
         return false;
@@ -339,6 +351,7 @@ Status XlaCompilationCache::CompileImpl(
 
     const uint64 compile_end_us = env->NowMicros();
     const uint64 compile_time_us = compile_end_us - compile_start_us;
+    metrics::UpdateXlaCompilationTime(compile_time_us);
     {
       mutex_lock lock(cluster_compile_stats_mu_);
       auto it = cluster_compile_stats_.find(function.name());
@@ -355,6 +368,16 @@ Status XlaCompilationCache::CompileImpl(
               << tensorflow::strings::HumanReadableElapsedTime(
                      it->second.cumulative_compile_time_us / 1.0e6)
               << ")";
+
+      XlaJitCompilationActivity jit_compilation_activity;
+      jit_compilation_activity.set_cluster_name(function.name());
+      jit_compilation_activity.set_compile_count(it->second.compile_count);
+      jit_compilation_activity.set_compile_time_us(compile_time_us);
+      jit_compilation_activity.set_cumulative_compile_time_us(
+          it->second.cumulative_compile_time_us);
+
+      TF_RETURN_IF_ERROR(
+          BroadcastXlaActivity(std::move(jit_compilation_activity)));
     }
   }
   TF_RETURN_IF_ERROR(entry->compilation_status);

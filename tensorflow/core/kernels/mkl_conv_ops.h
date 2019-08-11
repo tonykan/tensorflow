@@ -21,13 +21,13 @@ limitations under the License.
 #include <vector>
 
 #include "mkldnn.hpp"
+#include "tensorflow/core/framework/bounds_check.h"
 #include "tensorflow/core/framework/numeric_op.h"
 #include "tensorflow/core/framework/op_kernel.h"
 #include "tensorflow/core/framework/register_types.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/framework/tensor_shape.h"
 #include "tensorflow/core/framework/tensor_slice.h"
-#include "tensorflow/core/kernels/bounds_check.h"
 #include "tensorflow/core/kernels/conv_grad_ops.h"
 #include "tensorflow/core/kernels/ops_util.h"
 #include "tensorflow/core/lib/core/errors.h"
@@ -40,12 +40,20 @@ limitations under the License.
 #include "tensorflow/core/util/padding.h"
 #include "tensorflow/core/util/tensor_format.h"
 
+#ifndef ENABLE_MKLDNN_V1
 using mkldnn::convolution_direct;
+#endif  // !ENABLE_MKLDNN_V1
 using mkldnn::convolution_forward;
 using mkldnn::prop_kind;
 using mkldnn::stream;
 
 namespace tensorflow {
+
+#ifdef ENABLE_MKLDNN_V1
+#define MKLDNN_SIZE_DTYPE long int
+#else
+#define MKLDNN_SIZE_DTYPE int
+#endif  // ENABLE_MKLDNN_V1
 
 class MklDnnConvUtil {
  protected:
@@ -58,7 +66,7 @@ class MklDnnConvUtil {
  public:
   MklDnnConvUtil(OpKernelContext* context, const std::vector<int32>& strides,
                  Padding pad, TensorFormat fm,
-                 const std::vector<int32>& dilations)
+                 const std::vector<int32>& dilations, bool is_depthwise = false)
       : context_(context),
         strides_(strides),
         dilations_(dilations),
@@ -137,7 +145,7 @@ class MklDnnConvUtil {
       int input_cols = static_cast<int>(input_cols_raw);
 
       // MKL-DNN always requires input in NCHW format Conv2D.
-      std::vector<int> mkldnn_sizes(4, -1);
+      std::vector<MKLDNN_SIZE_DTYPE> mkldnn_sizes(4, -1);
       mkldnn_sizes[MklDnnDims::Dim_N] = input_batch;
       mkldnn_sizes[MklDnnDims::Dim_C] = input_depth;
       mkldnn_sizes[MklDnnDims::Dim_H] = input_rows;
@@ -161,7 +169,7 @@ class MklDnnConvUtil {
       int input_cols = static_cast<int>(input_cols_raw);
 
       // MKL-DNN always requires input in NCDHW format for Conv3D.
-      std::vector<int> mkldnn_sizes(5, -1);
+      std::vector<MKLDNN_SIZE_DTYPE> mkldnn_sizes(5, -1);
       mkldnn_sizes[MklDnnDims3D::Dim3d_N] = input_batch;
       mkldnn_sizes[MklDnnDims3D::Dim3d_C] = input_depth;
       mkldnn_sizes[MklDnnDims3D::Dim3d_D] = input_planes;
@@ -225,7 +233,7 @@ class MklDnnConvUtil {
       // GOIHW = (group, out_depth, in_depth, rows, cols)
       // Specifically for depthwise G=filter_indepth, O=filter_outdepth, I=1
       if (is_depthwise) {
-        std::vector<int> mkldnn_sizes(5, -1);
+        std::vector<MKLDNN_SIZE_DTYPE> mkldnn_sizes(5, -1);
         mkldnn_sizes[MKL_GROUP_FILTER_DIM_G] = filter_in_depth;
         mkldnn_sizes[MKL_GROUP_FILTER_DIM_O] = filter_out_depth;
         mkldnn_sizes[MKL_GROUP_FILTER_DIM_I] = 1;
@@ -234,7 +242,7 @@ class MklDnnConvUtil {
 
         *filter_dims = mkldnn_sizes;
       } else {
-        std::vector<int> mkldnn_sizes(4, -1);
+        std::vector<MKLDNN_SIZE_DTYPE> mkldnn_sizes(4, -1);
         mkldnn_sizes[MklDnnDims::Dim_O] = filter_out_depth;
         mkldnn_sizes[MklDnnDims::Dim_I] = filter_in_depth;
         mkldnn_sizes[MklDnnDims::Dim_H] = filter_rows;
@@ -262,7 +270,7 @@ class MklDnnConvUtil {
 
       // MKL-DNN always needs filter in OIDHW format.
       // OIDHW = (out_depth, in_depth, planes, rows, cols)
-      std::vector<int> mkldnn_sizes(5, -1);
+      std::vector<MKLDNN_SIZE_DTYPE> mkldnn_sizes(5, -1);
       mkldnn_sizes[MklDnnDims3D::Dim3d_O] = filter_out_depth;
       mkldnn_sizes[MklDnnDims3D::Dim3d_I] = filter_in_depth;
       mkldnn_sizes[MklDnnDims3D::Dim3d_D] = filter_planes;
@@ -392,6 +400,29 @@ class MklDnnConvUtil {
     int64 pad_D1, pad_D2;
 
     if (is_conv2d) {
+      Padding padding_type;
+      if (pad_enabled) {
+        padding_type = Padding::EXPLICIT;
+        pad_top = static_cast<int64>((*pad_l)[0]);
+        pad_left = static_cast<int64>((*pad_l)[1]);
+        pad_bottom = static_cast<int64>((*pad_r)[0]);
+        pad_right = static_cast<int64>((*pad_r)[1]);
+      } else {
+        padding_type = padding_;
+      }
+      OP_REQUIRES_OK(context_,
+                     GetWindowedOutputSizeVerboseV2(
+                         input_rows, filter_rows, dilation_rows, stride_rows,
+                         padding_type, &out_rows, &pad_top, &pad_bottom));
+      OP_REQUIRES_OK(context_,
+                     GetWindowedOutputSizeVerboseV2(
+                         input_cols, filter_cols, dilation_cols, stride_cols,
+                         padding_type, &out_cols, &pad_left, &pad_right));
+    } else {
+      OP_REQUIRES_OK(context_, GetWindowedOutputSizeVerboseV2(
+                                   input_planes, filter_planes, dilation_planes,
+                                   stride_planes, padding_, &out_planes,
+                                   &pad_D1, &pad_D2));
       OP_REQUIRES_OK(context_,
                      GetWindowedOutputSizeVerboseV2(
                          input_rows, filter_rows, dilation_rows, stride_rows,
@@ -400,38 +431,14 @@ class MklDnnConvUtil {
                      GetWindowedOutputSizeVerboseV2(
                          input_cols, filter_cols, dilation_cols, stride_cols,
                          padding_, &out_cols, &pad_left, &pad_right));
-    } else {
-      OP_REQUIRES_OK(context_, GetWindowedOutputSizeVerbose(
-                                   input_planes, filter_planes, stride_planes,
-                                   padding_, &out_planes, &pad_D1, &pad_D2));
-      OP_REQUIRES_OK(context_, GetWindowedOutputSizeVerbose(
-                                   input_rows, filter_rows, stride_rows,
-                                   padding_, &out_rows, &pad_top, &pad_bottom));
-      OP_REQUIRES_OK(context_, GetWindowedOutputSizeVerbose(
-                                   input_cols, filter_cols, stride_cols,
-                                   padding_, &out_cols, &pad_left, &pad_right));
     }
 
     if (is_conv2d) {
-      // Conv + pad fusion is enabled only for 2D
+      // Conv + pad fusion is enabled only for 2D.
       // If pad_enabled, i.e., pad and conv op are fused, then
       // all pads are already passed from pad op through
-      // *pad_l and *pad_r
-      if (pad_enabled) {
-        pad_top = static_cast<int64>((*pad_l)[0]);
-        pad_left = static_cast<int64>((*pad_l)[1]);
-        pad_bottom = static_cast<int64>((*pad_r)[0]);
-        pad_right = static_cast<int64>((*pad_r)[1]);
-        // update the out_rows and out_cols based on all
-        // sides of the pads coming from pad op.
-        out_rows = out_rows + (pad_top + pad_bottom) / stride_rows;
-        out_cols = out_cols + (pad_left + pad_right) / stride_cols;
-      }
-      // Handle padding. MKL-DNN uses asymetric padding.
-      // But, if pad_enabled, i.e., pad and conv op are fused,
-      // then, *pad_l and *pad_r are already set from pad op.
-      // In that case they need not set here.
-      else {
+      // *pad_l and *pad_r and they don't need to be set here.
+      if (!pad_enabled) {
         *pad_l = {static_cast<int>(pad_top), static_cast<int>(pad_left)};
         *pad_r = {static_cast<int>(pad_bottom), static_cast<int>(pad_right)};
       }
@@ -456,14 +463,14 @@ class MklDnnConvUtil {
 
     if (is_conv2d) {
       // For Conv2D, MKL-DNN always needs output in NCHW format.
-      std::vector<int> mkldnn_sizes(4, -1);
+      std::vector<MKLDNN_SIZE_DTYPE> mkldnn_sizes(4, -1);
       mkldnn_sizes[MklDnnDims::Dim_N] = out_batch;
       mkldnn_sizes[MklDnnDims::Dim_C] = out_depth;
       mkldnn_sizes[MklDnnDims::Dim_H] = static_cast<int>(out_rows);
       mkldnn_sizes[MklDnnDims::Dim_W] = static_cast<int>(out_cols);
       *output_dims_mkl_order = mkldnn_sizes;
     } else {
-      std::vector<int> mkldnn_sizes(5, -1);
+      std::vector<MKLDNN_SIZE_DTYPE> mkldnn_sizes(5, -1);
       mkldnn_sizes[MklDnnDims3D::Dim3d_N] = out_batch;
       mkldnn_sizes[MklDnnDims3D::Dim3d_C] = out_depth;
       mkldnn_sizes[MklDnnDims3D::Dim3d_D] = static_cast<int>(out_planes);
@@ -550,7 +557,7 @@ class MklDnnConvUtil {
 ///  Common class that implements ConvBackpropFilter and Input
 /////////////////////////////////////////////////////////////////////
 
-template <typename Device, class T>
+template <typename Device, class T, bool is_depthwise>
 class MklConvBackpropCommonOp : public OpKernel {
  public:
   ~MklConvBackpropCommonOp() {}
@@ -567,24 +574,32 @@ class MklConvBackpropCommonOp : public OpKernel {
         context, (stride_n == 1 && stride_c == 1),
         errors::InvalidArgument("Current implementation does not yet support "
                                 "strides in the batch and depth dimensions."));
-    OP_REQUIRES_OK(context, context->GetAttr("dilations", &dilations_));
 
-    if (strides_.size() == 4) {
-      // Check Conv2D dilations
-      OP_REQUIRES(context, dilations_.size() == 4,
-                  errors::InvalidArgument("Sliding window dilations field must "
-                                          "specify 4 dimensions"));
-      int dilation_n = GetTensorDim(dilations_, data_format_, 'N');
-      int dilation_c = GetTensorDim(dilations_, data_format_, 'C');
-      int dilation_h = GetTensorDim(dilations_, data_format_, 'H');
-      int dilation_w = GetTensorDim(dilations_, data_format_, 'W');
-      OP_REQUIRES(context, (dilation_n == 1 && dilation_c == 1),
-                  errors::InvalidArgument(
-                      "Current implementation does not yet support "
-                      "dilations in the batch and depth dimensions."));
-      OP_REQUIRES(
-          context, dilation_h > 0 && dilation_w > 0,
-          errors::InvalidArgument("Dilated rates should be larger than 0."));
+    // Depthwise Convolution doesn't have dilation parameter
+    if (!is_depthwise) {
+      OP_REQUIRES_OK(context, context->GetAttr("dilations", &dilations_));
+      if (strides_.size() == 4) {
+        // Check Conv2D dilations
+        OP_REQUIRES(
+            context, dilations_.size() == 4,
+            errors::InvalidArgument("Sliding window dilations field must "
+                                    "specify 4 dimensions"));
+        int dilation_n = GetTensorDim(dilations_, data_format_, 'N');
+        int dilation_c = GetTensorDim(dilations_, data_format_, 'C');
+        int dilation_h = GetTensorDim(dilations_, data_format_, 'H');
+        int dilation_w = GetTensorDim(dilations_, data_format_, 'W');
+        OP_REQUIRES(context, (dilation_n == 1 && dilation_c == 1),
+                    errors::InvalidArgument(
+                        "Current implementation does not yet support "
+                        "dilations in the batch and depth dimensions."));
+        OP_REQUIRES(
+            context, dilation_h > 0 && dilation_w > 0,
+            errors::InvalidArgument("Dilated rates should be larger than 0."));
+      }
+    } else {
+      // Set dilations as 1 for depthwise conv
+      // for future support to align with Tensorflow
+      dilations_ = {1, 1, 1, 1};
     }
 
     OP_REQUIRES_OK(context, context->GetAttr("padding", &padding_));
@@ -616,6 +631,8 @@ class MklDummyOp : public OpKernel {
                               "It should not have been invoked."));
   }
 };
+
+#undef MKLDNN_SIZE_DTYPE
 
 }  // namespace tensorflow
 

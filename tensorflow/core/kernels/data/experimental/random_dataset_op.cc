@@ -22,10 +22,8 @@ limitations under the License.
 
 namespace tensorflow {
 namespace data {
+namespace experimental {
 namespace {
-
-// See documentation in ../../ops/dataset_ops.cc for a high-level
-// description of the following op.
 
 class RandomDatasetOp : public DatasetOpKernel {
  public:
@@ -56,8 +54,8 @@ class RandomDatasetOp : public DatasetOpKernel {
 
     std::unique_ptr<IteratorBase> MakeIteratorInternal(
         const string& prefix) const override {
-      return std::unique_ptr<IteratorBase>(
-          new Iterator({this, strings::StrCat(prefix, "::Random")}));
+      return absl::make_unique<Iterator>(
+          Iterator::Params{this, strings::StrCat(prefix, "::Random")});
     }
 
     const DataTypeVector& output_dtypes() const override {
@@ -77,6 +75,8 @@ class RandomDatasetOp : public DatasetOpKernel {
     }
 
     int64 Cardinality() const override { return kInfiniteCardinality; }
+
+    Status CheckExternalState() const override { return Status::OK(); }
 
    protected:
     Status AsGraphDefInternal(SerializationContext* ctx,
@@ -154,9 +154,12 @@ class RandomDatasetOp : public DatasetOpKernel {
   };
 };
 
+REGISTER_KERNEL_BUILDER(Name("RandomDataset").Device(DEVICE_CPU),
+                        RandomDatasetOp);
 REGISTER_KERNEL_BUILDER(Name("ExperimentalRandomDataset").Device(DEVICE_CPU),
                         RandomDatasetOp);
 
 }  // namespace
+}  // namespace experimental
 }  // namespace data
 }  // namespace tensorflow
